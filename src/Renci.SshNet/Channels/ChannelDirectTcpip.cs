@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.IO.Pipelines;
 using Renci.SshNet.Abstractions;
 using Renci.SshNet.Common;
 using Renci.SshNet.Messages.Connection;
@@ -19,6 +20,7 @@ namespace Renci.SshNet.Channels
         private EventWaitHandle _channelData = new AutoResetEvent(false);
         private IForwardedPort _forwardedPort;
         private Socket _socket;
+        private IDuplexPipe _internalPipe;
 
         /// <summary>
         /// Initializes a new <see cref="ChannelDirectTcpip"/> instance.
@@ -51,14 +53,40 @@ namespace Renci.SshNet.Channels
                 throw new SshException("Session is not connected.");
 
             _socket = socket;
+
+            InternalOpen(remoteHost, port, forwardedPort, (IPEndPoint)socket.RemoteEndPoint);
+            
+        }
+
+        static int spoofedPorts = 0; //Per Process. Interlocked access.
+        public void Open(string remoteHost, uint port, IForwardedPort forwardedPort, IDuplexPipe internalPipe, IPEndPoint spoofedOriginator = null)
+        {
+            if (IsOpen)
+                throw new SshException("Channel is already open.");
+            if (!IsConnected)
+                throw new SshException("Session is not connected.");
+
+            _internalPipe = internalPipe;
+
+            if (spoofedOriginator == null)
+            {
+                var thisPort = Interlocked.Increment(ref spoofedPorts);
+                if (thisPort > ushort.MaxValue)
+                    throw new Exception("Auto generated spoofed ports only support 65535 connection starts; set your own spoofedOriginator endpoints to reuse closed connection spoofed ports and to use additional spoofed IP addresses.");
+                spoofedOriginator = new IPEndPoint(IPAddress.Parse("127.254.254.1"), thisPort);
+            }
+
+            InternalOpen(remoteHost, port, forwardedPort, spoofedOriginator);
+        }
+        
+        void InternalOpen(string remoteHost, uint port, IForwardedPort forwardedPort, IPEndPoint Originator)
+        {
             _forwardedPort = forwardedPort;
             _forwardedPort.Closing += ForwardedPort_Closing;
 
-            var ep = (IPEndPoint) socket.RemoteEndPoint;
-
             // open channel
             SendMessage(new ChannelOpenMessage(LocalChannelNumber, LocalWindowSize, LocalPacketSize,
-                new DirectTcpipChannelInfo(remoteHost, port, ep.Address.ToString(), (uint) ep.Port)));
+                new DirectTcpipChannelInfo(remoteHost, port, Originator.Address.ToString(), (uint)Originator.Port)));
             //  Wait for channel to open
             WaitOnHandle(_channelOpen);
         }
@@ -88,7 +116,10 @@ namespace Renci.SshNet.Channels
 
             var buffer = new byte[RemotePacketSize];
 
-            SocketAbstraction.ReadContinuous(_socket, buffer, 0, buffer.Length, SendData);
+            if (_socket != null)
+                SocketAbstraction.ReadContinuous(_socket, buffer, 0, buffer.Length, SendData);
+            else if (_internalPipe != null)
+                PipeAbstraction.ReadContinuous(_internalPipe, SendData);
 
             // even though the client has disconnected, we still want to properly close the
             // channel
@@ -185,6 +216,14 @@ namespace Renci.SshNet.Channels
                     {
                         SocketAbstraction.Send(_socket, data, 0, data.Length);
                     }
+                }
+            }
+            else if (_internalPipe != null)
+            {
+                lock (_socketLock)
+                {
+                    //TODO: Check not complete
+                    PipeAbstraction.Send(_internalPipe, data, data.Length);
                 }
             }
         }
